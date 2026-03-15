@@ -108,6 +108,7 @@
 #include "QueryHolder.h"
 #include "QueryResultStructured.h"
 #include "QuestDef.h"
+#include "QuestMgr.h"
 #include "QuestObjectiveCriteriaMgr.h"
 #include "QuestPackets.h"
 #include "RealmList.h"
@@ -1339,6 +1340,9 @@ bool Player::TeleportTo(TeleportLocation const& teleportLocation, TeleportToOpti
     }
     else
     {
+        if (IsBeingTeleportedFar())
+            return false;
+
         if (GetClass() == CLASS_DEATH_KNIGHT && GetMapId() == 609 && !IsGameMaster() && !HasSpell(50977))
         {
             SendTransferAborted(teleportLocation.Location.GetMapId(), TRANSFER_ABORT_UNIQUE_MESSAGE, 1);
@@ -1367,11 +1371,11 @@ bool Player::TeleportTo(TeleportLocation const& teleportLocation, TeleportToOpti
         SetSemaphoreTeleportNear(false);
         //setup delayed teleport flag
         SetDelayedTeleportFlag(IsCanDelayTeleport());
+        SetSemaphoreTeleportFar(true);
         //if teleport spell is cast in Unit::Update() func
         //then we need to delay it until update process will be finished
         if (IsHasDelayedTeleport())
         {
-            SetSemaphoreTeleportFar(true);
             //lets save teleport destination for player
             m_teleport_dest = teleportLocation;
             m_teleport_options = options;
@@ -2405,7 +2409,7 @@ void Player::InitStatsForLevel(bool reapplyMods)
 
     uint8 exp_max_lvl = GetMaxLevelForExpansion(GetSession()->GetExpansion());
     uint8 conf_max_lvl = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
-    if (exp_max_lvl == DEFAULT_MAX_LEVEL || exp_max_lvl >= conf_max_lvl)
+    if (exp_max_lvl == GetMaxLevelForExpansion(CURRENT_EXPANSION) || exp_max_lvl >= conf_max_lvl)
         SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::MaxLevel), conf_max_lvl);
     else
         SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::MaxLevel), exp_max_lvl);
@@ -10842,7 +10846,7 @@ InventoryResult Player::CanEquipItem(uint8 slot, uint16 &dest, Item* pItem, bool
             if (pItem->GetQuality() == ITEM_QUALITY_HEIRLOOM)
                 requiredLevels = sDB2Manager.GetContentTuningData(pItem->GetScalingContentTuningId(), {}, true);
 
-            if (requiredLevels && requiredLevels->MaxLevel < DEFAULT_MAX_LEVEL && requiredLevels->MaxLevel < GetLevel() && !sDB2Manager.GetHeirloomByItemId(pProto->GetId()))
+            if (requiredLevels && static_cast<uint32>(requiredLevels->MaxLevel) < GetMaxLevelForExpansion(CURRENT_EXPANSION) && requiredLevels->MaxLevel < GetLevel() && !sDB2Manager.GetHeirloomByItemId(pProto->GetId()))
                 return EQUIP_ERR_NOT_EQUIPPABLE;
 
             uint8 eslot = FindEquipSlot(pItem, slot, swap);
@@ -16070,6 +16074,8 @@ QuestGiverStatus Player::GetQuestDialogStatus(Object const* questgiver) const
                     result |= quest->HasFlag(QUEST_FLAGS_HIDE_REWARD_POI) ? QuestGiverStatus::CovenantCallingRewardCompleteNoPOI : QuestGiverStatus::CovenantCallingRewardCompletePOI;
                 else if (quest->HasFlagEx(QUEST_FLAGS_EX_LEGENDARY))
                     result |= quest->HasFlag(QUEST_FLAGS_HIDE_REWARD_POI) ? QuestGiverStatus::LegendaryRewardCompleteNoPOI : QuestGiverStatus::LegendaryRewardCompletePOI;
+                else if (QuestMgr::IsCampaignQuestStatusVisibleForPlayer(questId, this))
+                    result |= quest->HasFlag(QUEST_FLAGS_HIDE_REWARD_POI) ? QuestGiverStatus::JourneyRewardCompleteNoPOI : QuestGiverStatus::JourneyRewardCompletePOI;
                 else if (quest->IsDailyOrWeekly())
                     result |= quest->HasFlag(QUEST_FLAGS_HIDE_REWARD_POI) ? QuestGiverStatus::RepeatableRewardCompleteNoPOI : QuestGiverStatus::RepeatableRewardCompletePOI;
                 else
@@ -16084,6 +16090,8 @@ QuestGiverStatus Player::GetQuestDialogStatus(Object const* questgiver) const
                     result |= QuestGiverStatus::CovenantCallingReward;
                 else if (quest->HasFlagEx(QUEST_FLAGS_EX_LEGENDARY))
                     result |= QuestGiverStatus::LegendaryReward;
+                else if (QuestMgr::IsCampaignQuestStatusVisibleForPlayer(questId, this))
+                    result |= QuestGiverStatus::JourneyReward;
                 else if (quest->IsDailyOrWeekly())
                     result |= QuestGiverStatus::RepeatableReward;
                 else
@@ -16127,6 +16135,8 @@ QuestGiverStatus Player::GetQuestDialogStatus(Object const* questgiver) const
                         result |= QuestGiverStatus::CovenantCallingQuest;
                     else if (quest->HasFlagEx(QUEST_FLAGS_EX_LEGENDARY))
                         result |= isTrivial ? QuestGiverStatus::TrivialLegendaryQuest : QuestGiverStatus::LegendaryQuest;
+                    else if (QuestMgr::IsCampaignQuestStatusVisibleForPlayer(questId, this))
+                        result |= isTrivial ? QuestGiverStatus::TrivialJourneyQuest : QuestGiverStatus::JourneyQuest;
                     else if (quest->IsDailyOrWeekly())
                         result |= isTrivial ? QuestGiverStatus::TrivialRepeatableQuest : QuestGiverStatus::RepeatableQuest;
                     else
@@ -16136,6 +16146,8 @@ QuestGiverStatus Player::GetQuestDialogStatus(Object const* questgiver) const
                     result |= QuestGiverStatus::FutureImportantQuest;
                 else if (quest->HasFlagEx(QUEST_FLAGS_EX_LEGENDARY))
                     result |= QuestGiverStatus::FutureLegendaryQuest;
+                else if (QuestMgr::IsCampaignQuestStatusVisibleForPlayer(questId, this))
+                    result |= QuestGiverStatus::FutureJourneyQuest;
                 else
                     result |= QuestGiverStatus::Future;
             }
@@ -16145,10 +16157,10 @@ QuestGiverStatus Player::GetQuestDialogStatus(Object const* questgiver) const
     return result;
 }
 
-void Player::SkipQuests(std::vector<uint32> const& questIds)
+void Player::SkipQuests(std::span<uint32 const> questIds)
 {
     bool updateVisibility = false;
-    for (uint32 const& questId : questIds)
+    for (uint32 questId : questIds)
     {
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
         if (!quest)
@@ -25598,8 +25610,9 @@ bool Player::GetBGAccessByLevel(BattlegroundTypeId bgTypeId) const
 
     // limit check leel to dbc compatible level range
     uint32 level = GetLevel();
-    if (level > DEFAULT_MAX_LEVEL)
-        level = DEFAULT_MAX_LEVEL;
+    uint32 maxLevel = GetMaxLevelForExpansion(CURRENT_EXPANSION);
+    if (level > maxLevel)
+        level = maxLevel;
 
     if (level < bg->GetMinLevel() || level > bg->GetMaxLevel())
         return false;
