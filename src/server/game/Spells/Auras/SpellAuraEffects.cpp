@@ -4281,7 +4281,7 @@ void AuraEffect::HandleAuraModOverridePowerDisplay(AuraApplication const* aurApp
         return;
 
     Unit* target = aurApp->GetTarget();
-    if (target->GetPowerIndex(Powers(powerDisplay->ActualType)) == MAX_POWERS)
+    if (target->GetPowerIndex(Powers(powerDisplay->ActualType)) >= MAX_POWERS_PER_CLASS)
         return;
 
     if (apply)
@@ -5507,9 +5507,9 @@ void AuraEffect::HandleAuraPreventRegeneratePower(AuraApplication const* aurApp,
     if (target->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    for (int32 i = 0; i < MAX_POWERS; ++i)
-        if (GetMiscValue() & (1 << i))
-            target->ToPlayer()->UpdatePowerRegen(static_cast<Powers>(i));
+    for (Powers power : target->GetPowerTypes())
+        if (GetMiscValue() & (1 << power))
+            target->ToPlayer()->UpdatePowerRegen(power);
 }
 
 void AuraEffect::HandleAuraSetVehicle(AuraApplication const* aurApp, uint8 mode, bool apply) const
@@ -6155,7 +6155,7 @@ void AuraEffect::HandleBreakableCCAuraProc(AuraApplication* aurApp, ProcEventInf
 void AuraEffect::HandleProcTriggerSpellAuraProc(AuraApplication* aurApp, ProcEventInfo& eventInfo)
 {
     Unit* triggerCaster = aurApp->GetTarget();
-    Unit* triggerTarget = eventInfo.GetProcTarget();
+    Unit* triggerTarget = triggerCaster == eventInfo.GetActor() ? eventInfo.GetActionTarget() : eventInfo.GetActor();
     if (GetSpellInfo()->HasAttribute(SPELL_ATTR8_TARGET_PROCS_ON_CASTER) && eventInfo.GetTypeMask() & TAKEN_HIT_PROC_FLAG_MASK)
         triggerTarget = eventInfo.GetActor();
 
@@ -6180,7 +6180,7 @@ void AuraEffect::HandleProcTriggerSpellAuraProc(AuraApplication* aurApp, ProcEve
 void AuraEffect::HandleProcTriggerSpellWithValueAuraProc(AuraApplication* aurApp, ProcEventInfo& eventInfo)
 {
     Unit* triggerCaster = aurApp->GetTarget();
-    Unit* triggerTarget = eventInfo.GetProcTarget();
+    Unit* triggerTarget = triggerCaster == eventInfo.GetActor() ? eventInfo.GetActionTarget() : eventInfo.GetActor();
     if (GetSpellInfo()->HasAttribute(SPELL_ATTR8_TARGET_PROCS_ON_CASTER) && eventInfo.GetTypeMask() & TAKEN_HIT_PROC_FLAG_MASK)
         triggerTarget = eventInfo.GetActor();
 
@@ -6207,7 +6207,7 @@ void AuraEffect::HandleProcTriggerSpellWithValueAuraProc(AuraApplication* aurApp
 void AuraEffect::HandleProcTriggerDamageAuraProc(AuraApplication* aurApp, ProcEventInfo& eventInfo)
 {
     Unit* target = aurApp->GetTarget();
-    Unit* triggerTarget = eventInfo.GetProcTarget();
+    Unit* triggerTarget = target == eventInfo.GetActor() ? eventInfo.GetActionTarget() : eventInfo.GetActor();
     if (triggerTarget->IsImmunedToDamage(target, GetSpellInfo(), &GetSpellEffectInfo()))
     {
         SendTickImmune(triggerTarget, target);

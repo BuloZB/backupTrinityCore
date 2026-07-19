@@ -182,6 +182,8 @@ void AddSC_boss_venoxis();
 void AddSC_boss_wushoolay();
 void AddSC_boss_zanzil();
 void AddSC_instance_zulgurub();
+void AddSC_zulgurub();
+void AddSC_eastern_kingdoms();
 void AddSC_abyssal_depths();
 //void AddSC_alterac_mountains();
 //void AddSC_arathi_highlands();
@@ -212,6 +214,9 @@ void AddSC_boss_maiden_of_virtue_rtk();
 void AddSC_boss_the_curator_rtk();
 void AddSC_boss_mana_devourer();
 void AddSC_boss_shade_of_medivh();
+
+// Vashjir
+void AddSC_vashjir();
 
 // The name of this function should match:
 // void Add${NameOfDirectory}Scripts()
@@ -383,7 +388,8 @@ void AddEasternKingdomsScripts()
     AddSC_boss_wushoolay();
     AddSC_boss_zanzil();
     AddSC_instance_zulgurub();
-
+    AddSC_zulgurub();
+    AddSC_eastern_kingdoms();
     AddSC_abyssal_depths();
     //AddSC_alterac_mountains();
     //AddSC_arathi_highlands();
@@ -414,4 +420,7 @@ void AddEasternKingdomsScripts()
     AddSC_boss_the_curator_rtk();
     AddSC_boss_mana_devourer();
     AddSC_boss_shade_of_medivh();
+
+    // Vashjir
+    AddSC_vashjir();
 }

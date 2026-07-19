@@ -3822,8 +3822,8 @@ void Spell::_cast(bool skipCheck)
 
         // cleanup after mod system
         // triggered spell pointer can be not removed in some cases
-        if (m_caster->GetTypeId() == TYPEID_PLAYER)
-            m_caster->ToPlayer()->SetSpellModTakingSpell(this, false);
+        if (modOwner)
+            modOwner->SetSpellModTakingSpell(this, false);
 
         finish(SPELL_FAILED_INTERRUPTED);
         SetExecutedCurrently(false);
@@ -3832,7 +3832,7 @@ void Spell::_cast(bool skipCheck)
 
     if (Unit* unitCaster = m_caster->ToUnit())
         if (m_spellInfo->HasAttribute(SPELL_ATTR1_DISMISS_PET_FIRST))
-            if (Creature* pet = ObjectAccessor::GetCreature(*m_caster, unitCaster->GetPetGUID()))
+            if (Creature* pet = ObjectAccessor::GetCreatureOrPetOrVehicle(*m_caster, unitCaster->GetPetGUID()))
                 pet->DespawnOrUnsummon();
 
     PrepareTriggersExecutedOnHit();
@@ -3875,9 +3875,6 @@ void Spell::_cast(bool skipCheck)
     }
 
     // CAST SPELL
-    if (!m_spellInfo->HasAttribute(SPELL_ATTR12_START_COOLDOWN_ON_CAST_START))
-        SendSpellCooldown();
-
     m_spellState = SPELL_STATE_LAUNCHED;
 
     if (!m_spellInfo->LaunchDelay)
@@ -3891,6 +3888,9 @@ void Spell::_cast(bool skipCheck)
 
     // we must send smsg_spell_go packet before m_castItem delete in TakeCastItem()...
     SendSpellGo();
+
+    if (!m_spellInfo->HasAttribute(SPELL_ATTR12_START_COOLDOWN_ON_CAST_START))
+        SendSpellCooldown();
 
     if (!m_spellInfo->IsChanneled())
         if (Creature* creatureCaster = m_caster->ToCreature())
@@ -4228,10 +4228,7 @@ void Spell::SendSpellCooldown()
     if (!m_caster->IsUnit())
         return;
 
-    if (m_CastItem)
-        m_caster->ToUnit()->GetSpellHistory()->HandleCooldowns(m_spellInfo, m_CastItem, this);
-    else
-        m_caster->ToUnit()->GetSpellHistory()->HandleCooldowns(m_spellInfo, m_castItemEntry, this);
+    m_caster->ToUnit()->GetSpellHistory()->HandleCooldowns(m_spellInfo, m_castItemEntry, this);
 
     if (IsAutoRepeat())
         m_caster->ToUnit()->resetAttackTimer(RANGED_ATTACK);
@@ -4443,13 +4440,6 @@ void Spell::finish(SpellCastResult result)
                 unitCaster->setDeathState(JUST_DIED);
             return;
         }
-    }
-
-    // potions disabled by client, send event "not in combat" if need
-    if (unitCaster->GetTypeId() == TYPEID_PLAYER)
-    {
-        if (!m_triggeredByAuraSpell)
-            unitCaster->ToPlayer()->UpdatePotionCooldown(this);
     }
 
     // Stop Attack for some spells
@@ -5408,7 +5398,7 @@ void Spell::TakeCastItem()
     for (ItemEffectEntry const* itemEffect : m_CastItem->GetEffects())
     {
         // item has limited charges
-        if (itemEffect->Charges)
+        if (itemEffect->TriggerType == ITEM_SPELLTRIGGER_ON_USE && itemEffect->Charges)
         {
             if (itemEffect->Charges < 0)
                 expendable = true;
@@ -5795,10 +5785,6 @@ SpellCastResult Spell::CheckCast(bool strict, int32* param1 /*= nullptr*/, int32
                     }
                 }
             }
-
-            // check if we are using a potion in combat for the 2nd+ time. Cooldown is added only after caster gets out of combat
-            if (!IsIgnoringCooldowns() && playerCaster->GetLastPotionId() && m_CastItem && (m_CastItem->IsPotion() || m_spellInfo->IsCooldownStartedOnEvent()))
-                return SPELL_FAILED_NOT_READY;
         }
 
         if (!IsIgnoringCooldowns() && m_caster->ToUnit() && (!m_spellInfo->HasAttribute(SPELL_ATTR12_START_COOLDOWN_ON_CAST_START) || strict))
@@ -7346,7 +7332,10 @@ SpellRange Spell::GetMinMaxRange(bool strict) const
     SpellRange range;
 
     if (strict && m_spellInfo->IsNextMeleeSwingSpell())
+    {
+        range = { .Min = 0.0f, .Max = 100.0f };
         return range;
+    }
 
     Unit* unitCaster = m_caster->ToUnit();
     if (m_spellInfo->RangeEntry)

@@ -255,6 +255,8 @@ Player::Player(WorldSession* session) : Unit(true), m_sceneMgr(this)
     m_canParry = false;
     m_canBlock = false;
     m_canTitanGrip = false;
+    m_titanGripWeaponSubclasses = 0;
+    m_titanGripArmorSubclasses = 0;
     m_titanGripPenaltySpellId = 0;
 
     m_temporaryUnsummonedPetNumber = 0;
@@ -282,7 +284,6 @@ Player::Player(WorldSession* session) : Unit(true), m_sceneMgr(this)
     m_raidDifficulty = DIFFICULTY_NORMAL_RAID;
     m_legacyRaidDifficulty = DIFFICULTY_10_N;
 
-    m_lastPotionId = 0;
     m_empowerMinHoldStagePercent = 1.0f;
 
     m_auraBaseFlatMod.fill(0.0f);
@@ -478,7 +479,7 @@ bool Player::Create(ObjectGuid::LowType guidlow, WorldPackets::Character::Charac
 
     InitRunes();
 
-    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::Coinage), sWorld->GetUInt64Config(CONFIG_START_PLAYER_MONEY));
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::Coinage), GetStartMoney(createInfo->Race, createInfo->Class));
 
     // Played time
     m_Last_tick = GameTime::GetGameTime();
@@ -504,16 +505,9 @@ bool Player::Create(ObjectGuid::LowType guidlow, WorldPackets::Character::Charac
     LearnDefaultSkills();
     LearnCustomSpells();
 
-    // Original action bar. Do not use Player::AddActionButton because we do not have skill spells loaded at this time
-    // but checks will still be performed later when loading character from db in Player::_LoadActions
+    // original action bar
     for (PlayerCreateInfoActions::const_iterator action_itr = info->action.begin(); action_itr != info->action.end(); ++action_itr)
-    {
-        // create new button
-        ActionButton& ab = m_actionButtons[action_itr->button];
-
-        // set data
-        ab.SetActionAndType(action_itr->action, ActionButtonType(action_itr->type));
-    }
+        AddActionButton(action_itr->button, action_itr->action, action_itr->type);
 
     if (ChrSpecializationEntry const* defaultSpec = sDB2Manager.GetDefaultChrSpecializationForClass(GetClass()))
     {
@@ -1164,8 +1158,6 @@ void Player::setDeathState(DeathState s)
 
         InitializeSelfResurrectionSpells();
 
-        FailQuestsWithFlag(QUEST_FLAGS_COMPLETION_NO_DEATH);
-
         UpdateCriteria(CriteriaType::DieOnMap, 1);
         UpdateCriteria(CriteriaType::DieAnywhere, 1);
         UpdateCriteria(CriteriaType::DieInInstance, 1);
@@ -1284,7 +1276,7 @@ bool Player::TeleportTo(TeleportLocation const& teleportLocation, TeleportToOpti
     SetUnitMovementFlags(GetUnitMovementFlags() & MOVEMENTFLAG_MASK_HAS_PLAYER_STATUS_OPCODE);
     m_movementInfo.ResetJump();
     DisableSpline();
-    GetMotionMaster()->Remove(EFFECT_MOTION_TYPE);
+    GetMotionMaster()->InterruptOnTeleport();
 
     if (TransportBase* transport = GetTransport())
         if (!teleportLocation.TransportGuid || teleportLocation.TransportGuid != transport->GetTransportGUID())
@@ -1333,10 +1325,13 @@ bool Player::TeleportTo(TeleportLocation const& teleportLocation, TeleportToOpti
 
         // code for finish transfer called in WorldSession::HandleMovementOpcodes()
         // at client packet CMSG_MOVE_TELEPORT_ACK
-        SetTeleportState(TeleportState::WaitingForTeleportAck);
+        SetTeleportState(GetPlayerMovingMe() ? TeleportState::WaitingForTeleportAck : TeleportState::NotTeleporting);
         // near teleport, triggering send CMSG_MOVE_TELEPORT_ACK from client at landing
         if (!GetSession()->PlayerLogout())
             SendTeleportPacket(m_teleport_dest);
+
+        if (!IsBeingTeleportedNear()) // update position immediately if we will not be waiting for client ACK
+            UpdatePosition(m_teleport_dest.Location, true);
     }
     else
     {
@@ -1599,7 +1594,7 @@ void Player::RegenerateAll()
 {
     m_regenTimerCount += m_regenTimer;
 
-    for (Powers power = POWER_MANA; power < MAX_POWERS; power = Powers(power + 1))
+    for (Powers power : GetPowerTypes())
         if (power != POWER_RUNES)
             Regenerate(power);
 
@@ -1640,7 +1635,7 @@ void Player::Regenerate(Powers power)
 {
     // Skip regeneration for power type we cannot have
     uint32 powerIndex = GetPowerIndex(power);
-    if (powerIndex == MAX_POWERS || powerIndex >= MAX_POWERS_PER_CLASS)
+    if (powerIndex >= MAX_POWERS_PER_CLASS)
         return;
 
     PowerTypeEntry const* powerType = sDB2Manager.GetPowerTypeEntry(power);
@@ -1734,7 +1729,7 @@ void Player::Regenerate(Powers power)
 void Player::InterruptPowerRegen(Powers power)
 {
     uint32 powerIndex = GetPowerIndex(power);
-    if (powerIndex == MAX_POWERS || powerIndex >= MAX_POWERS_PER_CLASS)
+    if (powerIndex >= MAX_POWERS_PER_CLASS)
         return;
 
     m_regenInterruptTimestamp = GameTime::Now();
@@ -2455,8 +2450,8 @@ void Player::InitStatsForLevel(bool reapplyMods)
     InitDataForForm(reapplyMods);
 
     // save new stats
-    for (uint8 i = POWER_MANA; i < MAX_POWERS; ++i)
-        SetMaxPower(Powers(i), uint32(GetCreatePowerValue(Powers(i))));
+    for (Powers power : GetPowerTypes())
+        SetMaxPower(power, GetCreatePowerValue(power));
 
     SetMaxHealth(0);                          // stamina bonus will applied later
 
@@ -4247,6 +4242,8 @@ void Player::BuildPlayerRepop()
     if (HasSpell(20585))
         CastSpell(this, 20584, true);
     CastSpell(this, 8326, true);
+
+    FailQuestsWithFlag(QUEST_FLAGS_COMPLETION_NO_DEATH);
 
     RemoveAurasWithInterruptFlags(SpellAuraInterruptFlags::Release);
 
@@ -6697,7 +6694,7 @@ bool Player::RewardHonor(Unit* victim, uint32 groupsize, int32 honor, HonorGainS
         return false;
 
     ObjectGuid victim_guid;
-    uint32 victim_rank = 0;
+    int32 victim_rank = 0;
 
     // need call before fields update to have chance move yesterday data to appropriate fields before today data change.
     UpdateHonorFields();
@@ -6728,27 +6725,7 @@ bool Player::RewardHonor(Unit* victim, uint32 groupsize, int32 honor, HonorGainS
             if (v_level <= k_grey)
                 return false;
 
-            // PLAYER_CHOSEN_TITLE VALUES DESCRIPTION
-            //  [0]      Just name
-            //  [1..14]  Alliance honor titles and player name
-            //  [15..28] Horde honor titles and player name
-            //  [29..38] Other title and player name
-            //  [39+]    Nothing
-            // this is all wrong, should be going off PvpTitle, not PlayerTitle
-            uint32 victim_title = plrVictim->m_playerData->PlayerTitle;
-                                                        // Get Killer titles, CharTitlesEntry::MaskID
-            // Ranks:
-            //  title[1..14]  -> rank[5..18]
-            //  title[15..28] -> rank[5..18]
-            //  title[other]  -> 0
-            if (victim_title == 0)
-                victim_guid.Clear();                     // Don't show HK: <rank> message, only log.
-            else if (victim_title < 15)
-                victim_rank = victim_title + 4;
-            else if (victim_title < 29)
-                victim_rank = victim_title - 14 + 4;
-            else
-                victim_guid.Clear();                     // Don't show HK: <rank> message, only log.
+            victim_rank = plrVictim->m_activePlayerData->LifetimeMaxRank;
 
             honor_f = std::ceil(Trinity::Honor::hk_honor_at_level_f(k_level) * (v_level - k_grey) / (k_level - k_grey));
 
@@ -8793,72 +8770,56 @@ void Player::CastItemCombatSpell(DamageInfo const& damageInfo, Item* item, ItemT
     }
 }
 
-void Player::CastItemUseSpell(Item* item, SpellCastTargets const& targets, ObjectGuid castCount, std::array<int32, 3> const& misc)
+void Player::CastItemUseSpell(Item* item, uint32 spellId, SpellCastTargets const& targets, ObjectGuid castCount, std::array<int32, 3> const& misc)
 {
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+    if (!spellInfo)
+    {
+        TC_LOG_ERROR("entities.player", "Player::CastItemUseSpell: Item (Entry: {}) has wrong spell id {}, ignoring", item->GetEntry(), spellId);
+        return;
+    }
+
+    ItemTemplate const* proto = item->GetTemplate();
+    bool isValidSpell = false;
     if (!item->GetTemplate()->HasFlag(ITEM_FLAG_LEGACY))
     {
-        // item spells cast at use
-        for (ItemEffectEntry const* effectData : item->GetEffects())
+        isValidSpell = std::ranges::any_of(item->GetEffects(), [spellId](ItemEffectEntry const* effectData)
         {
-            // wrong triggering type
-            if (effectData->TriggerType != ITEM_SPELLTRIGGER_ON_USE)
-                continue;
-
-            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(effectData->SpellID, DIFFICULTY_NONE);
-            if (!spellInfo)
-            {
-                TC_LOG_ERROR("entities.player", "Player::CastItemUseSpell: Item (Entry: {}) has wrong spell id {}, ignoring", item->GetEntry(), effectData->SpellID);
-                continue;
-            }
-
-            Spell* spell = new Spell(this, spellInfo, TRIGGERED_NONE);
-
-            WorldPackets::Spells::SpellPrepare spellPrepare;
-            spellPrepare.ClientCastID = castCount;
-            spellPrepare.ServerCastID = spell->m_castId;
-            SendDirectMessage(spellPrepare.Write());
-
-            spell->m_fromClient = true;
-            spell->m_CastItem = item;
-            std::ranges::copy(misc, std::ranges::begin(spell->m_misc.Raw.Data));
-            spell->prepare(targets);
-            return;
-        }
+            return effectData->SpellID == int32(spellId) && effectData->TriggerType == ITEM_SPELLTRIGGER_ON_USE;
+        });
     }
 
-    // Item enchantments spells cast at use
-    for (uint8 e_slot = 0; e_slot < MAX_ENCHANTMENT_SLOT; ++e_slot)
+    if (!isValidSpell)
     {
-        uint32 enchant_id = item->GetEnchantmentId(EnchantmentSlot(e_slot));
-        SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(enchant_id);
-        if (!pEnchant)
-            continue;
-        for (uint8 s = 0; s < MAX_ITEM_ENCHANTMENT_EFFECTS; ++s)
+        isValidSpell = [&]
         {
-            if (pEnchant->Effect[s] != ITEM_ENCHANTMENT_TYPE_USE_SPELL)
-                continue;
+            for (uint8 slot = 0; slot < MAX_ENCHANTMENT_SLOT; ++slot)
+                if (SpellItemEnchantmentEntry const* enchant = sSpellItemEnchantmentStore.LookupEntry(item->GetEnchantmentId(EnchantmentSlot(slot))))
+                    for (uint8 enchantEffect = 0; enchantEffect < MAX_ITEM_ENCHANTMENT_EFFECTS; ++enchantEffect)
+                        if (enchant->Effect[enchantEffect] == ITEM_ENCHANTMENT_TYPE_USE_SPELL && enchant->EffectArg[enchantEffect] == spellId)
+                            return true;
 
-            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(pEnchant->EffectArg[s], DIFFICULTY_NONE);
-            if (!spellInfo)
-            {
-                TC_LOG_ERROR("entities.player", "Player::CastItemUseSpell: Enchant {}, cast unknown spell {}", pEnchant->ID, pEnchant->EffectArg[s]);
-                continue;
-            }
-
-            Spell* spell = new Spell(this, spellInfo, TRIGGERED_NONE);
-
-            WorldPackets::Spells::SpellPrepare spellPrepare;
-            spellPrepare.ClientCastID = castCount;
-            spellPrepare.ServerCastID = spell->m_castId;
-            SendDirectMessage(spellPrepare.Write());
-
-            spell->m_fromClient = true;
-            spell->m_CastItem = item;
-            std::ranges::copy(misc, std::ranges::begin(spell->m_misc.Raw.Data));
-            spell->prepare(targets);
-            return;
-        }
+            return false;
+        }();
     }
+
+    if (!isValidSpell)
+    {
+        TC_LOG_ERROR("entities.player", "Player::CastItemUseSpell: Tried to cast Spell {} not found on Item {}, ignoring", spellId, proto->GetId());
+        return;
+    }
+
+    Spell* spell = new Spell(this, spellInfo, TRIGGERED_NONE);
+
+    WorldPackets::Spells::SpellPrepare spellPrepare;
+    spellPrepare.ClientCastID = castCount;
+    spellPrepare.ServerCastID = spell->m_castId;
+    SendDirectMessage(spellPrepare.Write());
+
+    spell->m_fromClient = true;
+    spell->m_CastItem = item;
+    std::ranges::copy(misc, std::ranges::begin(spell->m_misc.Raw.Data));
+    spell->prepare(targets);
 }
 
 void Player::ApplyItemLootedSpell(Item* item, bool apply)
@@ -9297,7 +9258,7 @@ uint8 Player::FindEquipSlot(Item const* item, uint8 slot, bool swap) const
             break;
         case INVTYPE_2HWEAPON:
             slots[0] = EQUIPMENT_SLOT_MAINHAND;
-            if (CanDualWield() && CanTitanGrip())
+            if (CanDualWield() && CanTitanGrip(item))
                 slots[1] = EQUIPMENT_SLOT_OFFHAND;
             break;
         case INVTYPE_TABARD:
@@ -9853,6 +9814,18 @@ void Player::SetInventorySlotCount(uint8 slots)
     SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::NumBackpackSlots), slots);
 }
 
+void Player::UpdateInventorySlotCount()
+{
+    uint8 slotCount = INVENTORY_DEFAULT_SIZE;
+    if (HasPlayerLocalFlag(PLAYER_LOCAL_FLAG_ACCOUNT_SECURED))
+        slotCount += INVENTORY_ACCOUNT_SECURED_BONUS_SIZE;
+
+    if (AuraEffect const* alpacaSaddlebags = GetAuraEffect(SPELL_ALPACA_SADDLEBAGS, EFFECT_0))
+        slotCount += alpacaSaddlebags->GetAmountAsInt();
+
+    SetInventorySlotCount(slotCount);
+}
+
 bool Player::HasItemCount(uint32 item, uint32 count, bool inBankAlso) const
 {
     ItemSearchLocation location = ItemSearchLocation::Equipment | ItemSearchLocation::Inventory | ItemSearchLocation::ReagentBank;
@@ -10082,6 +10055,8 @@ InventoryResult Player::CanStoreItem_InSpecificSlot(uint8 bag, uint8 slot, ItemP
             // prevent cheating
             if ((slot >= BUYBACK_SLOT_START && slot < BUYBACK_SLOT_END) || slot >= PLAYER_SLOT_END)
                 return EQUIP_ERR_WRONG_BAG_TYPE;
+            if (slot < INVENTORY_SLOT_ITEM_END && slot >= INVENTORY_SLOT_ITEM_START + GetInventorySlotCount())
+                return EQUIP_ERR_NO_SLOT_AVAILABLE;
         }
         else
         {
@@ -10266,8 +10241,8 @@ InventoryResult Player::CanStoreItem(uint8 bag, uint8 slot, ItemPosCountVec &des
 
     if (pItem)
     {
-        // item used
-        if (pItem->m_lootGenerated)
+        // swapping/merging with currently looted item
+        if (GetLootGUID() == pItem->GetGUID())
         {
             if (no_space_count)
                 *no_space_count = count;
@@ -10570,8 +10545,7 @@ InventoryResult Player::CanStoreItems(Item** items, int count, uint32* offending
         if (!pProto)
             return EQUIP_ERR_ITEM_NOT_FOUND;
 
-        // item used
-        if (item->m_lootGenerated)
+        if (item->m_lootGenerated || GetLootGUID() == item->GetGUID())
             return EQUIP_ERR_LOOT_GONE;
 
         // item it 'bind'
@@ -10747,8 +10721,7 @@ InventoryResult Player::CanEquipItem(uint8 slot, uint16 &dest, Item* pItem, bool
         ItemTemplate const* pProto = pItem->GetTemplate();
         if (pProto)
         {
-            // item used
-            if (pItem->m_lootGenerated)
+            if (GetLootGUID() == pItem->GetGUID())
                 return EQUIP_ERR_LOOT_GONE;
 
             if (pItem->IsBindedNotWith(this))
@@ -10890,7 +10863,7 @@ InventoryResult Player::CanEquipItem(uint8 slot, uint16 &dest, Item* pItem, bool
                 }
                 else if (type == INVTYPE_2HWEAPON)
                 {
-                    if (!CanDualWield() || !CanTitanGrip())
+                    if (!CanDualWield() || !CanTitanGrip(pItem))
                         return EQUIP_ERR_2HSKILLNOTFOUND;
                 }
 
@@ -10899,17 +10872,9 @@ InventoryResult Player::CanEquipItem(uint8 slot, uint16 &dest, Item* pItem, bool
             }
 
             // equip two-hand weapon case (with possible unequip 2 items)
-            if (type == INVTYPE_2HWEAPON)
+            if (eslot == EQUIPMENT_SLOT_MAINHAND)
             {
-                if (eslot == EQUIPMENT_SLOT_OFFHAND)
-                {
-                    if (!CanTitanGrip())
-                        return EQUIP_ERR_NOT_EQUIPPABLE;
-                }
-                else if (eslot != EQUIPMENT_SLOT_MAINHAND)
-                    return EQUIP_ERR_NOT_EQUIPPABLE;
-
-                if (!CanTitanGrip())
+                if (!CanTitanGrip(pItem))
                 {
                     // offhand item must can be stored in inventory for offhand item and it also must be unequipped
                     Item* offItem = GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
@@ -10987,8 +10952,7 @@ InventoryResult Player::CanUnequipItem(uint16 pos, bool swap) const
     if (!pProto)
         return EQUIP_ERR_ITEM_NOT_FOUND;
 
-    // item used
-    if (pItem->m_lootGenerated)
+    if (GetLootGUID() == pItem->GetGUID())
         return EQUIP_ERR_LOOT_GONE;
 
     if (IsCharmed())
@@ -11032,8 +10996,7 @@ InventoryResult Player::CanBankItem(uint8 bag, uint8 slot, ItemPosCountVec& dest
     if (!pProto)
         return swap ? EQUIP_ERR_CANT_SWAP : EQUIP_ERR_ITEM_NOT_FOUND;
 
-    // item used
-    if (pItem->m_lootGenerated)
+    if (GetLootGUID() == pItem->GetGUID())
         return EQUIP_ERR_LOOT_GONE;
 
     if (pItem->IsBindedNotWith(this))
@@ -11263,10 +11226,18 @@ InventoryResult Player::CanUseItem(ItemTemplate const* proto, bool skipRequiredL
         return EQUIP_ERR_CANT_EQUIP_REPUTATION;
 
     // learning (recipes, mounts, pets, etc.)
-    if (proto->Effects.size() >= 2)
-        if (proto->Effects[0]->SpellID == 483 || proto->Effects[0]->SpellID == 55884)
-            if (HasSpell(proto->Effects[1]->SpellID))
-                return EQUIP_ERR_INTERNAL_BAG_ERROR;
+    uint32 learnableCount = 0;
+    uint32 learnedCount = 0;
+    for (ItemEffectEntry const* itemEffect : proto->Effects)
+    {
+        if (itemEffect->TriggerType != ITEM_SPELLTRIGGER_ON_LEARN)
+            continue;
+
+        ++learnableCount;
+        learnedCount += HasSpell(itemEffect->SpellID) ? 1 : 0;
+    }
+    if (learnableCount && learnedCount == learnableCount)
+        return EQUIP_ERR_NONE;
 
     if (ArtifactEntry const* artifact = sArtifactStore.LookupEntry(proto->GetArtifactID()))
         if (ChrSpecialization(artifact->ChrSpecializationID) != GetPrimarySpecialization())
@@ -11807,7 +11778,7 @@ void Player::SetVisibleItemSlot(uint8 slot, Item const* item)
     if (item)
     {
         TransmogOutfitSlotOption transmogSlotOption = item->GetTemplate()->GetWeaponTransmogOutfitSlotOption();
-        if (transmogSlotOption == TransmogOutfitSlotOption::TwoHandedWeapon && CanTitanGrip())
+        if (transmogSlotOption == TransmogOutfitSlotOption::TwoHandedWeapon && CanTitanGrip(item))
             transmogSlotOption = TransmogOutfitSlotOption::FuryTwoHandedWeapon;
 
         int32 itemId = item->GetVisibleEntry(this);
@@ -13151,18 +13122,58 @@ bool Player::IsUseEquipedWeapon(bool mainhand) const
     return !IsInFeralForm() && (!mainhand || !HasUnitFlag(UNIT_FLAG_DISARMED));
 }
 
-void Player::SetCanTitanGrip(bool value, uint32 penaltySpellId /*= 0*/)
+bool Player::CanTitanGrip(Item const* item) const
 {
-    if (value == m_canTitanGrip)
-        return;
+    if (!m_canTitanGrip)
+        return false;
 
+    ItemTemplate const* itemTemplate = item->GetTemplate();
+
+    uint32 subClassMask = [&]
+    {
+        switch (itemTemplate->GetClass())
+        {
+            case ITEM_CLASS_WEAPON:
+                return m_titanGripWeaponSubclasses;
+            case ITEM_CLASS_ARMOR:
+                return m_titanGripArmorSubclasses;
+            default:
+                break;
+        }
+        return 0u;
+    }();
+
+    return !subClassMask || subClassMask & (1 << itemTemplate->GetSubClass());
+}
+
+void Player::SetCanTitanGrip(bool value, uint32 penaltySpellId /*= 0*/, int32 allowedItemClass /*= 0*/, int32 allowedItemSubClassMask /*= 0*/)
+{
     m_canTitanGrip = value;
+    if (value)
+    {
+        switch (allowedItemClass)
+        {
+            case ITEM_CLASS_WEAPON:
+                m_titanGripWeaponSubclasses = allowedItemSubClassMask;
+                break;
+            case ITEM_CLASS_ARMOR:
+                m_titanGripArmorSubclasses = allowedItemSubClassMask;
+                break;
+            default:
+                break;
+        }
+    }
+    else
+    {
+        m_titanGripWeaponSubclasses = 0;
+        m_titanGripArmorSubclasses = 0;
+    }
     m_titanGripPenaltySpellId = penaltySpellId;
 }
 
 void Player::CheckTitanGripPenalty()
 {
-    if (!CanTitanGrip())
+    if (!m_titanGripPenaltySpellId)
         return;
 
     bool apply = IsUsingTwoHandedWeaponInOneHand();
@@ -13182,7 +13193,7 @@ bool Player::IsTwoHandUsed() const
         return false;
 
     ItemTemplate const* itemTemplate = mainItem->GetTemplate();
-    return (itemTemplate->GetInventoryType() == INVTYPE_2HWEAPON && !CanTitanGrip()) ||
+    return (itemTemplate->GetInventoryType() == INVTYPE_2HWEAPON && !CanTitanGrip(mainItem)) ||
         itemTemplate->GetInventoryType() == INVTYPE_RANGED ||
         (itemTemplate->GetInventoryType() == INVTYPE_RANGEDRIGHT && itemTemplate->GetClass() == ITEM_CLASS_WEAPON && itemTemplate->GetSubClass() != ITEM_SUBCLASS_WEAPON_WAND);
 }
@@ -18695,25 +18706,17 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
 
     // restore remembered power/health values (but not more max values)
     SetHealth(savedHealth > GetMaxHealth() ? GetMaxHealth() : savedHealth);
-    uint32 loadedPowers = 0;
-    for (uint32 i = 0; i < MAX_POWERS; ++i)
+    ClassPowerTypes powerTypes = GetPowerTypes();
+    for (uint32 i = 0; i < powerTypes.PowerTypeCount; ++i)
     {
-        if (GetPowerIndex(Powers(i)) != MAX_POWERS)
-        {
-            uint32 savedPower = fields.powers[loadedPowers];
-            uint32 maxPower = m_unitData->MaxPower[loadedPowers];
-            SetPower(Powers(i), (savedPower > maxPower) ? maxPower : savedPower);
-            if (++loadedPowers >= MAX_POWERS_PER_CLASS)
-                break;
-        }
+        int32 savedPower = fields.powers[i];
+        int32 maxPower = m_unitData->MaxPower[i];
+        SetPower(powerTypes.PowerType[i], std::min(savedPower, maxPower));
     }
-
-    for (; loadedPowers < MAX_POWERS_PER_CLASS; ++loadedPowers)
-        SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::Power, loadedPowers), 0);
 
     SetPower(POWER_LUNAR_POWER, 0);
     // Init rune recharge
-    if (GetPowerIndex(POWER_RUNES) != MAX_POWERS)
+    if (GetPowerIndex(POWER_RUNES) < MAX_POWERS_PER_CLASS)
     {
         int32 runes = GetPower(POWER_RUNES);
         int32 maxRunes = GetMaxPower(POWER_RUNES);
@@ -19160,6 +19163,8 @@ void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult arti
     //the bagMap is filled before items in the bags are loaded
     //NOTE2: the "order by `slot`" is needed because mainhand weapons are (wrongly?)
     //expected to be equipped before offhand items (@todo fixme)
+
+    UpdateInventorySlotCount();
 
     std::unordered_map<ObjectGuid::LowType, ItemAdditionalLoadInfo> additionalData;
     ItemAdditionalLoadInfo::Init(&additionalData, artifactsResult, azeriteResult, azeriteItemMilestonePowersResult,
@@ -20036,7 +20041,8 @@ bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbo
         if (!mapEntry)
             return false;
 
-        Difficulty target_difficulty = GetDifficultyID(mapEntry);
+        Group const* group = GetGroup();
+        Difficulty target_difficulty = group ? group->GetDifficultyID(mapEntry) : GetDifficultyID(mapEntry);
         MapDifficultyEntry const* mapDiff = sDB2Manager.GetDownscaledMapDifficultyData(target_map, target_difficulty);
         if (!sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_LEVEL))
         {
@@ -20078,7 +20084,7 @@ bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbo
                 missingQuest = ar->quest_H;
 
             Player* leader = this;
-            ObjectGuid leaderGuid = GetGroup() ? GetGroup()->GetLeaderGUID() : GetGUID();
+            ObjectGuid leaderGuid = group ? group->GetLeaderGUID() : GetGUID();
             if (leaderGuid != GetGUID())
                 leader = ObjectAccessor::FindPlayer(leaderGuid);
 
@@ -21800,17 +21806,17 @@ void Player::SendExplorationExperience(uint32 Area, uint32 Experience) const
     SendDirectMessage(WorldPackets::Misc::ExplorationExperience(Experience, Area).Write());
 }
 
-void Player::SendDungeonDifficulty(int32 forcedDifficulty /*= -1*/) const
+void Player::SendDungeonDifficulty() const
 {
     WorldPackets::Misc::DungeonDifficultySet dungeonDifficultySet;
-    dungeonDifficultySet.DifficultyID = forcedDifficulty == -1 ? GetDungeonDifficultyID() : forcedDifficulty;
+    dungeonDifficultySet.DifficultyID = GetDungeonDifficultyID();
     SendDirectMessage(dungeonDifficultySet.Write());
 }
 
-void Player::SendRaidDifficulty(bool legacy, int32 forcedDifficulty /*= -1*/) const
+void Player::SendRaidDifficulty(bool legacy) const
 {
     WorldPackets::Misc::RaidDifficultySet raidDifficultySet;
-    raidDifficultySet.DifficultyID = forcedDifficulty == -1 ? (legacy ? GetLegacyRaidDifficultyID() : GetRaidDifficultyID()) : forcedDifficulty;
+    raidDifficultySet.DifficultyID = legacy ? GetLegacyRaidDifficultyID() : GetRaidDifficultyID();
     raidDifficultySet.Legacy = legacy;
     SendDirectMessage(raidDifficultySet.Write());
 }
@@ -24057,34 +24063,6 @@ void Player::UpdatePvP(bool state, bool _override)
     }
 }
 
-void Player::UpdatePotionCooldown(Spell* spell)
-{
-    // no potion used i combat or still in combat
-    if (!m_lastPotionId || IsInCombat())
-        return;
-
-    // Call not from spell cast, send cooldown event for item spells if no in combat
-    if (!spell)
-    {
-        // spell/item pair let set proper cooldown (except non-existing charged spell cooldown spellmods for potions)
-        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(m_lastPotionId))
-            for (uint8 idx = 0; idx < proto->Effects.size(); ++idx)
-                if (proto->Effects[idx]->TriggerType == ITEM_SPELLTRIGGER_ON_USE)
-                    if (SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(proto->Effects[idx]->SpellID, DIFFICULTY_NONE))
-                        GetSpellHistory()->SendCooldownEvent(spellInfo, m_lastPotionId);
-    }
-    // from spell cases (m_lastPotionId set in Spell::SendSpellCooldown)
-    else
-    {
-        if (spell->IsIgnoringCooldowns())
-            return;
-        else
-            GetSpellHistory()->SendCooldownEvent(spell->m_spellInfo, m_lastPotionId, spell);
-    }
-
-    m_lastPotionId = 0;
-}
-
 void Player::SetResurrectRequestData(WorldObject const* caster, uint32 health, uint32 mana, uint32 appliedAura)
 {
     ASSERT(!IsResurrectRequested());
@@ -24411,6 +24389,35 @@ uint8 Player::GetStartLevel(uint8 race, uint8 playerClass, Optional<int32> chara
         startLevel = std::max<uint8>(sWorld->getIntConfig(CONFIG_START_GM_LEVEL), startLevel);
 
     return startLevel;
+}
+
+uint64 Player::GetStartMoney(uint8 race, uint8 playerClass)
+{
+    uint64 startMoney = 0;
+
+    switch (playerClass)
+    {
+        case CLASS_DEATH_KNIGHT:
+            if (race == RACE_PANDAREN_ALLIANCE || race == RACE_PANDAREN_HORDE)
+                startMoney = sWorld->GetUInt64Config(CONFIG_START_ALLIED_RACE_MONEY);
+            else
+                startMoney = sWorld->GetUInt64Config(CONFIG_START_DEATH_KNIGHT_PLAYER_MONEY);
+            break;
+        case CLASS_DEMON_HUNTER:
+            startMoney = sWorld->GetUInt64Config(CONFIG_START_DEMON_HUNTER_PLAYER_MONEY);
+            break;
+        case CLASS_EVOKER:
+            startMoney = sWorld->GetUInt64Config(CONFIG_START_EVOKER_PLAYER_MONEY);
+            break;
+        default:
+            startMoney = sWorld->GetUInt64Config(CONFIG_START_PLAYER_MONEY);
+            break;
+    }
+
+    if (sChrRacesStore.AssertEntry(race)->GetFlags().HasFlag(ChrRacesFlag::IsAlliedRace))
+        startMoney = sWorld->GetUInt64Config(CONFIG_START_ALLIED_RACE_MONEY);
+
+    return startMoney;
 }
 
 bool Player::HaveAtClient(BaseEntity const* u) const
@@ -25038,25 +25045,10 @@ void Player::SendInitialPacketsAfterAddToMap()
 
     CastSpell(this, 836, true);                             // LOGINEFFECT
 
-    // set some aura effects that send packet to player client after add player to map
-    // SendMessageToSet not send it to player not it map, only for aura that not changed anything at re-apply
-    // same auras state lost at far teleport, send it one more time in this case also
-    static constexpr AuraType auratypes[] =
-    {
-        SPELL_AURA_MOD_FEAR,     SPELL_AURA_TRANSFORM,                 SPELL_AURA_WATER_WALK,
-        SPELL_AURA_FEATHER_FALL, SPELL_AURA_HOVER,                     SPELL_AURA_SAFE_FALL,
-        SPELL_AURA_FLY,          SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED, SPELL_AURA_ADV_FLYING
-    };
-    for (AuraType auraType : auratypes)
-        if (Unit::AuraEffectList const& auraList = GetAuraEffectsByType(auraType); !auraList.empty())
-            auraList.front()->HandleEffect(this, AURA_EFFECT_HANDLE_SEND_FOR_CLIENT, true);
-
-    if (HasAuraType(SPELL_AURA_MOD_STUN) || HasAuraType(SPELL_AURA_MOD_STUN_DISABLE_GRAVITY))
-        SetRooted(true);
-
     WorldPackets::Movement::MoveSetCompoundState setCompoundState;
+
     // manual send package (have code in HandleEffect(this, AURA_EFFECT_HANDLE_SEND_FOR_CLIENT, true); that must not be re-applied.
-    if (HasAuraType(SPELL_AURA_MOD_ROOT) || HasAuraType(SPELL_AURA_MOD_ROOT_2) || HasAuraType(SPELL_AURA_MOD_ROOT_DISABLE_GRAVITY))
+    if (HasAuraType(SPELL_AURA_MOD_STUN) || HasAuraType(SPELL_AURA_MOD_ROOT) || HasAuraType(SPELL_AURA_MOD_ROOT_2) || HasAuraType(SPELL_AURA_MOD_ROOT_DISABLE_GRAVITY))
         setCompoundState.StateChanges.emplace_back(SMSG_MOVE_ROOT, m_movementCounter++);
 
     if (HasAuraType(SPELL_AURA_FEATHER_FALL))
@@ -25068,13 +25060,19 @@ void Player::SendInitialPacketsAfterAddToMap()
     if (HasAuraType(SPELL_AURA_HOVER))
         setCompoundState.StateChanges.emplace_back(SMSG_MOVE_SET_HOVERING, m_movementCounter++);
 
+    if (HasAuraType(SPELL_AURA_FLY) || HasAuraType(SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED) || HasAuraType(SPELL_AURA_ADV_FLYING))
+        setCompoundState.StateChanges.emplace_back(SMSG_MOVE_SET_CAN_FLY, m_movementCounter++);
+
+    if (HasAuraType(SPELL_AURA_ADV_FLYING))
+        setCompoundState.StateChanges.emplace_back(SMSG_MOVE_SET_CAN_ADV_FLY, m_movementCounter++);
+
     if (HasAuraType(SPELL_AURA_MOD_ROOT_DISABLE_GRAVITY) || HasAuraType(SPELL_AURA_MOD_STUN_DISABLE_GRAVITY) || HasAuraType(SPELL_AURA_DISABLE_GRAVITY))
         setCompoundState.StateChanges.emplace_back(SMSG_MOVE_DISABLE_GRAVITY, m_movementCounter++);
 
     if (HasAuraType(SPELL_AURA_CAN_TURN_WHILE_FALLING))
         setCompoundState.StateChanges.emplace_back(SMSG_MOVE_SET_CAN_TURN_WHILE_FALLING, m_movementCounter++);
 
-    if (HasAura(SPELL_DH_DOUBLE_JUMP))
+    if (HasAura(SPELL_DH_DOUBLE_JUMP) || HasAuraType(SPELL_AURA_ADV_FLYING))
         setCompoundState.StateChanges.emplace_back(SMSG_MOVE_ENABLE_DOUBLE_JUMP, m_movementCounter++);
 
     if (HasAuraType(SPELL_AURA_IGNORE_MOVEMENT_FORCES))
@@ -25089,19 +25087,13 @@ void Player::SendInitialPacketsAfterAddToMap()
         SendDirectMessage(setCompoundState.Write());
     }
 
+    if (HasUnitState(UNIT_STATE_FLEEING | UNIT_STATE_CONFUSED) || HasAuraType(SPELL_AURA_MOD_CONFUSE) || HasAuraType(SPELL_AURA_MOD_FEAR))
+        SetClientControl(this, false);
+
     SendAurasForTarget(this);
     SendEnchantmentDurations();                             // must be after add to map
     SendItemDurations();                                    // must be after add to map
     SendItemPassives();                                     // must be after add to map
-
-    if (GetMap()->IsRaid())
-    {
-        Difficulty mapDifficulty = GetMap()->GetDifficultyID();
-        DifficultyEntry const* difficulty = sDifficultyStore.LookupEntry(mapDifficulty);
-        SendRaidDifficulty(difficulty && (difficulty->Flags & DIFFICULTY_FLAG_LEGACY) != 0, mapDifficulty);
-    }
-    else if (GetMap()->IsNonRaidDungeon())
-        SendDungeonDifficulty(GetMap()->GetDifficultyID());
 
     PhasingHandler::OnMapChange(this);
 
@@ -26110,15 +26102,25 @@ void Player::AutoUnequipOffhandIfNeed(bool force /*= false*/)
     if (!offItem)
         return;
 
-     // unequip offhand weapon if player doesn't have dual wield anymore
+    ItemTemplate const* offhandTemplate = offItem->GetTemplate();
+
+    // unequip offhand weapon if player doesn't have dual wield anymore
     if (!CanDualWield()
-        && ((offItem->GetTemplate()->GetInventoryType() == INVTYPE_WEAPONOFFHAND && !offItem->GetTemplate()->HasFlag(ITEM_FLAG3_ALWAYS_ALLOW_DUAL_WIELD))
-            || offItem->GetTemplate()->GetInventoryType() == INVTYPE_WEAPON))
+        && ((offhandTemplate->GetInventoryType() == INVTYPE_WEAPONOFFHAND && !offhandTemplate->HasFlag(ITEM_FLAG3_ALWAYS_ALLOW_DUAL_WIELD))
+            || offhandTemplate->GetInventoryType() == INVTYPE_WEAPON))
         force = true;
 
     // need unequip offhand for 2h-weapon without TitanGrip (in any from hands)
-    if (!force && (CanTitanGrip() || (offItem->GetTemplate()->GetInventoryType() != INVTYPE_2HWEAPON && !IsTwoHandUsed())))
-        return;
+    if (!force)
+    {
+        Item* mainItem = GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        if ((!mainItem || mainItem->GetTemplate()->GetInventoryType() != INVTYPE_2HWEAPON)
+            && offhandTemplate->GetInventoryType() != INVTYPE_2HWEAPON)
+            return;
+
+        if ((!mainItem || CanTitanGrip(mainItem)) && CanTitanGrip(offItem))
+            return;
+    }
 
     ItemPosCountVec off_dest;
     if (CanStoreItem(NULL_BAG, NULL_SLOT, off_dest, offItem, false) == EQUIP_ERR_OK)
@@ -26806,7 +26808,6 @@ void Player::AtEnterCombat()
 void Player::AtExitCombat()
 {
     Unit::AtExitCombat();
-    UpdatePotionCooldown();
     m_regenInterruptTimestamp = GameTime::Now();
 }
 
@@ -27100,7 +27101,7 @@ void Player::InitRunes()
         return;
 
     uint32 runeIndex = GetPowerIndex(POWER_RUNES);
-    if (runeIndex == MAX_POWERS)
+    if (runeIndex >= MAX_POWERS_PER_CLASS)
         return;
 
     m_runes = std::make_unique<Runes>();
@@ -31027,6 +31028,16 @@ void Player::UpdateWarModeAuras()
     }
 }
 
+void Player::SetAccountSecured(bool secured)
+{
+    if (secured)
+        SetPlayerLocalFlag(PLAYER_LOCAL_FLAG_ACCOUNT_SECURED);
+    else
+        RemovePlayerLocalFlag(PLAYER_LOCAL_FLAG_ACCOUNT_SECURED);
+
+    UpdateInventorySlotCount();
+}
+
 void Player::AddUnlockedTransmogOutfits(std::span<int32 const> transmogOutfitIds)
 {
     auto unlockedTransmogOutfits = m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::UnlockedTransmogOutfits);
@@ -31291,58 +31302,59 @@ void Player::_SaveCharacterSelectOutfit(CharacterDatabaseTransaction trans) cons
         int32 secondaryItemModifiedAppearanceId = 0;
         uint8 sheatheCategory = 0;
 
-        if (TransmogMgr::TransmogOutfitSlotAndOptionInfo const* slotInfo = TransmogMgr::GetSlotAndOption(i, transmogSlotOption))
+        if (Item const* item = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
         {
-            UF::TransmogOutfitSlotData const& transmogOutfitSlot = outfit->Slots[slotInfo->SlotIndex];
+            if (TransmogMgr::TransmogOutfitSlotAndOptionInfo const* slotInfo = TransmogMgr::GetSlotAndOption(i, transmogSlotOption))
+            {
+                UF::TransmogOutfitSlotData const& transmogOutfitSlot = outfit->Slots[slotInfo->SlotIndex];
 
-            uint32 itemModifiedAppearanceId = transmogOutfitSlot.ItemModifiedAppearanceID;
-            if (!isTransmogDisplayed(static_cast<TransmogOutfitDisplayType>(*transmogOutfitSlot.AppearanceDisplayType)))
-                itemModifiedAppearanceId = m_playerData->VisibleItems[i].ItemModifiedAppearanceID;
-
-            if (Item const* item = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
                 itemId = item->GetEntry();
+                uint32 itemModifiedAppearanceId = transmogOutfitSlot.ItemModifiedAppearanceID;
+                if (!isTransmogDisplayed(static_cast<TransmogOutfitDisplayType>(*transmogOutfitSlot.AppearanceDisplayType)))
+                    itemModifiedAppearanceId = m_playerData->VisibleItems[i].ItemModifiedAppearanceID;
 
-            if (ItemModifiedAppearanceEntry const* itemModifiedAppearance = sItemModifiedAppearanceStore.LookupEntry(itemModifiedAppearanceId))
-            {
-                TransmogHolidayEntry const* transmogHoliday = sTransmogHolidayStore.LookupEntry(itemModifiedAppearance->ItemID);
-                if (!transmogHoliday || IsHolidayActive(static_cast<HolidayIds>(transmogHoliday->RequiredTransmogHoliday)))
+                if (ItemModifiedAppearanceEntry const* itemModifiedAppearance = sItemModifiedAppearanceStore.LookupEntry(itemModifiedAppearanceId))
                 {
-                    if (ItemEntry const* item = sItemStore.LookupEntry(itemModifiedAppearance->ItemID))
+                    TransmogHolidayEntry const* transmogHoliday = sTransmogHolidayStore.LookupEntry(itemModifiedAppearance->ItemID);
+                    if (!transmogHoliday || IsHolidayActive(static_cast<HolidayIds>(transmogHoliday->RequiredTransmogHoliday)))
                     {
-                        visibleItemId = item->ID;
-                        subClass = item->SubclassID;
-                        inventoryType = static_cast<InventoryType>(item->InventoryType);
+                        if (ItemEntry const* itemEntry = sItemStore.LookupEntry(itemModifiedAppearance->ItemID))
+                        {
+                            visibleItemId = itemEntry->ID;
+                            subClass = itemEntry->SubclassID;
+                            inventoryType = static_cast<InventoryType>(itemEntry->InventoryType);
+                        }
+
+                        if (ItemAppearanceEntry const* itemAppearance = sItemAppearanceStore.LookupEntry(itemModifiedAppearance->ItemAppearanceID))
+                            displayId = itemAppearance->ItemDisplayInfoID;
                     }
-
-                    if (ItemAppearanceEntry const* itemAppearance = sItemAppearanceStore.LookupEntry(itemModifiedAppearance->ItemAppearanceID))
-                        displayId = itemAppearance->ItemDisplayInfoID;
                 }
-            }
 
-            if (SpellItemEnchantmentEntry const* spellItemEnchantment = sSpellItemEnchantmentStore.LookupEntry(transmogOutfitSlot.SpellItemEnchantmentID))
-                itemVisual = spellItemEnchantment->ItemVisual;
+                if (SpellItemEnchantmentEntry const* spellItemEnchantment = sSpellItemEnchantmentStore.LookupEntry(transmogOutfitSlot.SpellItemEnchantmentID))
+                    itemVisual = spellItemEnchantment->ItemVisual;
 
-            if (!isTransmogDisplayed(static_cast<TransmogOutfitDisplayType>(*transmogOutfitSlot.IllusionDisplayType)))
-                itemVisual = m_playerData->VisibleItems[i].ItemVisual;
+                if (!isTransmogDisplayed(static_cast<TransmogOutfitDisplayType>(*transmogOutfitSlot.IllusionDisplayType)))
+                    itemVisual = m_playerData->VisibleItems[i].ItemVisual;
 
-            if (TransmogOutfitSlotInfoEntry const* secondarySlot = sTransmogOutfitSlotInfoStore.LookupEntry(slotInfo->Slot->SecondarySlotID))
-            {
-                if (TransmogMgr::TransmogOutfitSlotAndOptionInfo const* secondarySlotInfo = TransmogMgr::GetSlotAndOption(secondarySlot->GetSlot(), transmogSlotOption))
+                if (TransmogOutfitSlotInfoEntry const* secondarySlot = sTransmogOutfitSlotInfoStore.LookupEntry(slotInfo->Slot->SecondarySlotID))
                 {
-                    UF::TransmogOutfitSlotData const& secondaryTransmogOutfitSlot = outfit->Slots[secondarySlotInfo->SlotIndex];
+                    if (TransmogMgr::TransmogOutfitSlotAndOptionInfo const* secondarySlotInfo = TransmogMgr::GetSlotAndOption(secondarySlot->GetSlot(), transmogSlotOption))
+                    {
+                        UF::TransmogOutfitSlotData const& secondaryTransmogOutfitSlot = outfit->Slots[secondarySlotInfo->SlotIndex];
 
-                    secondaryItemModifiedAppearanceId = secondaryTransmogOutfitSlot.ItemModifiedAppearanceID;
-                    if (!isTransmogDisplayed(static_cast<TransmogOutfitDisplayType>(*secondaryTransmogOutfitSlot.AppearanceDisplayType)))
-                        secondaryItemModifiedAppearanceId = m_playerData->VisibleItems[i].SecondaryItemModifiedAppearanceID;
+                        secondaryItemModifiedAppearanceId = secondaryTransmogOutfitSlot.ItemModifiedAppearanceID;
+                        if (!isTransmogDisplayed(static_cast<TransmogOutfitDisplayType>(*secondaryTransmogOutfitSlot.AppearanceDisplayType)))
+                            secondaryItemModifiedAppearanceId = m_playerData->VisibleItems[i].SecondaryItemModifiedAppearanceID;
 
-                    if (ItemModifiedAppearanceEntry const* itemModifiedAppearance = sItemModifiedAppearanceStore.LookupEntry(secondaryItemModifiedAppearanceId))
-                        if (TransmogHolidayEntry const* transmogHoliday = sTransmogHolidayStore.LookupEntry(itemModifiedAppearance->ItemID))
-                            if (!IsHolidayActive(static_cast<HolidayIds>(transmogHoliday->RequiredTransmogHoliday)))
-                                secondaryItemModifiedAppearanceId = 0;
+                        if (ItemModifiedAppearanceEntry const* itemModifiedAppearance = sItemModifiedAppearanceStore.LookupEntry(secondaryItemModifiedAppearanceId))
+                            if (TransmogHolidayEntry const* transmogHoliday = sTransmogHolidayStore.LookupEntry(itemModifiedAppearance->ItemID))
+                                if (!IsHolidayActive(static_cast<HolidayIds>(transmogHoliday->RequiredTransmogHoliday)))
+                                    secondaryItemModifiedAppearanceId = 0;
+                    }
                 }
-            }
 
-            sheatheCategory = transmogOutfitSlot.SheatheCategory;
+                sheatheCategory = transmogOutfitSlot.SheatheCategory;
+            }
         }
 
         stmt->setUInt32(1 + (i * 8) + 0, itemId);
@@ -31706,7 +31718,7 @@ bool Player::ProcessItemCast(SpellCastRequest& castRequest, SpellCastTargets con
     if (!sScriptMgr->OnItemUse(this, item, targets, castRequest.CastRequest.CastID))
     {
         // no script or script not process request by self
-        CastItemUseSpell(item, targets, castRequest.CastRequest.CastID, castRequest.CastRequest.Misc);
+        CastItemUseSpell(item, castRequest.CastRequest.SpellID, targets, castRequest.CastRequest.CastID, castRequest.CastRequest.Misc);
     }
 
     return true;

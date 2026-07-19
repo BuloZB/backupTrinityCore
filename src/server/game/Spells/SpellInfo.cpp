@@ -1775,22 +1775,21 @@ bool SpellInfo::IsStackableWithRanks() const
         return false;
 
     // All stance spells. if any better way, change it.
-    for (SpellEffectInfo const& effect : GetEffects())
+    switch (SpellFamilyName)
     {
-        switch (SpellFamilyName)
-        {
-            case SPELLFAMILY_PALADIN:
-                // Paladin aura Spell
-                if (effect.Effect == SPELL_EFFECT_APPLY_AREA_AURA_RAID)
-                    return false;
-                break;
-            case SPELLFAMILY_DRUID:
-                // Druid form Spell
-                if (effect.Effect == SPELL_EFFECT_APPLY_AURA &&
-                    effect.ApplyAuraName == SPELL_AURA_MOD_SHAPESHIFT)
-                    return false;
-                break;
-        }
+        case SPELLFAMILY_PALADIN:
+            // Paladin aura Spell
+            if (HasEffect(SPELL_EFFECT_APPLY_AREA_AURA_RAID))
+                return false;
+            // Seal of Righteousness
+            if (SpellFamilyFlags[1] & 0x20000000)
+                return false;
+            break;
+        case SPELLFAMILY_DRUID:
+            // Druid form Spell
+            if (HasAura(SPELL_AURA_MOD_SHAPESHIFT))
+                return false;
+            break;
     }
 
     return true;
@@ -1817,6 +1816,11 @@ bool SpellInfo::IsCooldownStartedOnEvent() const
     if (HasAttribute(SPELL_ATTR0_COOLDOWN_ON_EVENT))
         return true;
 
+    return IsCooldownStartedOnEventAfterCombat();
+}
+
+bool SpellInfo::IsCooldownStartedOnEventAfterCombat() const
+{
     SpellCategoryEntry const* category = sSpellCategoryStore.LookupEntry(CategoryId);
     return category && category->GetFlags().HasFlag(SpellCategoryFlags::CooldownEventOnLeaveCombat);
 }
@@ -1901,7 +1905,7 @@ bool SpellInfo::IsRangedWeaponSpell() const
 {
     return (SpellFamilyName == SPELLFAMILY_HUNTER && !(SpellFamilyFlags[1] & 0x10000000)) // for 53352, cannot find better way
         || (EquippedItemSubClassMask & ITEM_SUBCLASS_MASK_WEAPON_RANGED)
-        || (Attributes & SPELL_ATTR0_USES_RANGED_SLOT);
+        || (HasAttribute(SPELL_ATTR0_USES_RANGED_SLOT));
 }
 
 bool SpellInfo::IsAutoRepeatRangedSpell() const
@@ -4383,7 +4387,7 @@ float SpellInfo::CalcProcPPM(Unit* caster, int32 itemLevel) const
             }
             case SPELL_PPM_MOD_RACE:
             {
-                if (caster->GetRaceMask() & mod->Param)
+                if (Trinity::RaceMask<int32>{ mod->Param }.HasRace(caster->GetRace()))
                     ppm *= 1.0f + mod->Coeff;
                 break;
             }
