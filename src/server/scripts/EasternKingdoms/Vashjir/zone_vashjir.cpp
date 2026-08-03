@@ -35,22 +35,20 @@ class spell_vashjir_sea_legs_aura : public AuraScript
         return ValidateSpellInfo({ Spells::SeaLegsAura });
     }
 
-    void CalcPeriodic(AuraEffect const* /*aurEff*/, bool& isPeriodic, int32& amplitude) const
+    static void CalcPeriodic(AuraScript const&, AuraEffect const* /*aurEff*/, bool& isPeriodic, int32& amplitude)
     {
         isPeriodic = true;
         amplitude = 500;
     }
 
-    void OnUpdate(AuraEffect* /*aurEff*/)
+    void OnUpdate(AuraEffect const* /*aurEff*/) const
     {
         Unit* target = GetTarget();
         if (target->IsInWater())
             target->CastSpell(target, Spells::SeaLegsAura, TRIGGERED_IGNORE_CAST_IN_PROGRESS);
-        else
-            target->RemoveAura(Spells::SeaLegsAura);
     }
 
-    void OnRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+    void OnRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/) const
     {
         GetTarget()->RemoveAura(Spells::SeaLegsAura);
     }
@@ -58,8 +56,22 @@ class spell_vashjir_sea_legs_aura : public AuraScript
     void Register() override
     {
         DoEffectCalcPeriodic += AuraEffectCalcPeriodicFn(spell_vashjir_sea_legs_aura::CalcPeriodic, EFFECT_0, SPELL_AURA_DUMMY);
-        OnEffectUpdatePeriodic += AuraEffectUpdatePeriodicFn(spell_vashjir_sea_legs_aura::OnUpdate, EFFECT_0, SPELL_AURA_DUMMY);
+        OnEffectPeriodic += AuraEffectPeriodicFn(spell_vashjir_sea_legs_aura::OnUpdate, EFFECT_0, SPELL_AURA_DUMMY);
         AfterEffectRemove += AuraEffectRemoveFn(spell_vashjir_sea_legs_aura::OnRemove, EFFECT_0, SPELL_AURA_DUMMY, AURA_EFFECT_HANDLE_REAL);
+    }
+};
+
+// 76143 - Low Health
+class spell_vashjir_low_health : public AuraScript
+{
+    void OnApply(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+    {
+        GetTarget()->SetHealth(GetTarget()->CountPctFromMaxHealth(10));
+    }
+
+    void Register() override
+    {
+        AfterEffectApply += AuraEffectApplyFn(spell_vashjir_low_health::OnApply, EFFECT_0, SPELL_AURA_DUMMY, AURA_EFFECT_HANDLE_REAL);
     }
 };
 }
@@ -70,4 +82,5 @@ void AddSC_vashjir()
 
     // Spells
     RegisterSpellScript(spell_vashjir_sea_legs_aura);
+    RegisterSpellScript(spell_vashjir_low_health);
 }
